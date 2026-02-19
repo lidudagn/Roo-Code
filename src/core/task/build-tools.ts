@@ -1,4 +1,5 @@
 import path from "path"
+
 import type OpenAI from "openai"
 
 import type { ProviderSettings, ModeConfig, ModelInfo } from "@roo-code/types"
@@ -13,9 +14,6 @@ import {
 	filterMcpToolsForMode,
 	resolveToolAlias,
 } from "../prompts/tools/filter-tools-for-mode"
-
-// --- GOVERNANCE IMPORT ---
-import { selectActiveIntentTool } from "../../orchestration/intentSelectionTool"
 
 interface BuildToolsOptions {
 	provider: ClineProvider
@@ -144,17 +142,13 @@ export async function buildNativeToolsArrayWithRestrictions(options: BuildToolsO
 	}
 
 	// Combine filtered tools (for backward compatibility and for allowedFunctionNames)
-	// --- GOVERNANCE INJECTION ---
-	// Injecting the mandatory handshake tool into the filtered toolset.
-	const filteredTools = [...filteredNativeTools, ...filteredMcpTools, ...nativeCustomTools, selectActiveIntentTool]
+	const filteredTools = [...filteredNativeTools, ...filteredMcpTools, ...nativeCustomTools]
 
 	// If includeAllToolsWithRestrictions is true, return ALL tools but provide
 	// allowed names based on mode filtering
 	if (includeAllToolsWithRestrictions) {
 		// Combine ALL tools (unfiltered native + all MCP + custom)
-		// --- GOVERNANCE INJECTION ---
-		// Ensuring the governance tool is also in the full pool for restricted providers (Gemini).
-		const allTools = [...nativeTools, ...mcpTools, ...nativeCustomTools, selectActiveIntentTool]
+		const allTools = [...nativeTools, ...mcpTools, ...nativeCustomTools]
 
 		// Extract names of tools that are allowed based on mode filtering.
 		// Resolve any alias names to canonical names to ensure consistency with allTools
