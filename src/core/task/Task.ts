@@ -132,7 +132,8 @@ import { AutoApprovalHandler, checkAutoApproval } from "../auto-approval"
 import { MessageManager } from "../message-manager"
 import { validateAndFixToolResultIds } from "./validateToolResultIds"
 import { mergeConsecutiveApiMessages } from "./mergeConsecutiveApiMessages"
-
+import { IntentLoader } from "../../hooks/context/intentLoader.js"
+import { ContextInjector } from "../../hooks/context/contextInjector.js"
 const MAX_EXPONENTIAL_BACKOFF_SECONDS = 600 // 10 minutes
 const DEFAULT_USAGE_COLLECTION_TIMEOUT_MS = 5000 // 5 seconds
 const FORCED_CONTEXT_REDUCTION_PERCENT = 75 // Keep 75% of context (remove 25%) on context window errors
@@ -166,7 +167,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	readonly parentTaskId?: string
 	childTaskId?: string
 	pendingNewTaskToolCallId?: string
-
+	private activeIntentId: string | null = null
+	private intentLoader = new IntentLoader()
 	readonly instanceId: string
 	readonly metadata: TaskMetadata
 
@@ -1637,7 +1639,20 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// to ensure tool_use/tool_result pairs are complete in history
 		await this.flushPendingToolResultsToHistory()
 
-		const systemPrompt = await this.getSystemPrompt()
+		// --- START GOVERNANCE INJECTION ---
+		let systemPrompt = await this.getSystemPrompt()
+
+		if (this.activeIntentId) {
+			try {
+				// Fetch the specific rules for this intent from your YAML
+				const intentContext = await this.intentLoader.getFormattedContext(this.cwd, this.activeIntentId)
+				// Wrap the original prompt with the new constraints
+				systemPrompt = ContextInjector.inject(systemPrompt, intentContext)
+			} catch (error) {
+				console.error("[Governance] Failed to inject intent context:", error)
+			}
+		}
+		// --- END GOVERNANCE INJECTION ---
 
 		// Get condensing configuration
 		const state = await this.providerRef.deref()?.getState()

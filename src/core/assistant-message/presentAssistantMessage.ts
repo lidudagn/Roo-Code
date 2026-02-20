@@ -1,3 +1,4 @@
+import * as vscode from "vscode"
 import { serializeError } from "serialize-error"
 import { Anthropic } from "@anthropic-ai/sdk"
 
@@ -40,7 +41,7 @@ import { codebaseSearchTool } from "../tools/CodebaseSearchTool"
 
 import { formatResponse } from "../prompts/responses"
 import { sanitizeToolUseId } from "../../utils/tool-id"
-
+import { enforceScope, loadIntentScope, requestManualApproval, classifyAction } from "../../hooks/scopeEnforcer"
 /**
  * Processes and presents assistant message content to the user interface.
  *
@@ -383,6 +384,11 @@ export async function presentAssistantMessage(cline: Task) {
 						return `[${block.name} for '${block.params.skill}'${block.params.args ? ` with args: ${block.params.args}` : ""}]`
 					case "generate_image":
 						return `[${block.name} for '${block.params.path}']`
+
+					// --- GOVERNANCE TOOL DESCRIPTION ---
+					case "select_active_intent":
+						return `[${block.name} for intent '${block.params.intent_id}']`
+
 					default:
 						return `[${block.name}]`
 				}
@@ -415,10 +421,16 @@ export async function presentAssistantMessage(cline: Task) {
 			//
 			// This avoids executing an invalid tool_use block and prevents duplicate/fragmented
 			// error reporting.
+			// If this is a native tool call but the parser couldn't construct nativeArgs
 			if (!block.partial) {
 				const customTool = stateExperiments?.customTools ? customToolRegistry.get(block.name) : undefined
 				const isKnownTool = isValidToolName(String(block.name), stateExperiments)
-				if (isKnownTool && !block.nativeArgs && !customTool) {
+
+				// 🚫 EXCEPTION FOR OUR GOVERNANCE TOOL
+				if (block.name === "select_active_intent") {
+					// Skip validation for our tool - it will be handled in the switch
+					console.log("🔓 Bypassing nativeArgs check for select_active_intent")
+				} else if (isKnownTool && !block.nativeArgs && !customTool) {
 					const errorMessage =
 						`Invalid tool call for '${block.name}': missing nativeArgs. ` +
 						`This usually means the model streamed invalid or incomplete arguments and the call could not be finalized.`
@@ -430,8 +442,6 @@ export async function presentAssistantMessage(cline: Task) {
 						// Best-effort only
 					}
 
-					// Push tool_result directly without setting didAlreadyUseTool so streaming can
-					// continue gracefully.
 					cline.pushToolResultToUserContent({
 						type: "tool_result",
 						tool_use_id: sanitizeToolUseId(toolCallId),
@@ -594,7 +604,8 @@ export async function presentAssistantMessage(cline: Task) {
 							{} as Record<string, boolean>,
 						) ?? {}
 
-					validateToolUse(
+					// 👇 UPDATED: Add governance parameters
+					await validateToolUse(
 						block.name as ToolName,
 						mode ?? defaultModeSlug,
 						customModes ?? [],
@@ -602,10 +613,12 @@ export async function presentAssistantMessage(cline: Task) {
 						block.params,
 						stateExperiments,
 						includedTools,
+						(cline as any).activeIntentId, // 👈 Add active intent
+						vscode.workspace.workspaceFolders?.[0].uri.fsPath, // 👈 Add workspace root
 					)
 				} catch (error) {
 					cline.consecutiveMistakeCount++
-					// For validation errors (unknown tool, tool not allowed for mode), we need to:
+					// For validation errors (unknown tool, tool not allowed for mode, OR GOVERNANCE BLOCK), we need to:
 					// 1. Send a tool_result with the error (required for native tool calling)
 					// 2. NOT set didAlreadyUseTool = true (the tool was never executed, just failed validation)
 					// This prevents the stream from being interrupted with "Response interrupted by tool use result"
@@ -676,7 +689,33 @@ export async function presentAssistantMessage(cline: Task) {
 			}
 
 			switch (block.name) {
-				case "write_to_file":
+				case "write_to_file": {
+					if (block.partial) break
+
+					// --- GOVERNANCE GUARD START ---
+					const activeIntentId = (cline as any).activeIntentId
+					const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath || ""
+					const activeIntent = activeIntentId
+						? await loadIntentScope(workspaceRoot, activeIntentId)
+						: undefined
+
+					const check = await enforceScope("write_to_file", block.params, activeIntent)
+					if (!check.allowed) {
+						pushToolResult(`GOVERNANCE ERROR: ${check.reason}`)
+						break
+					}
+
+					const isApproved = await requestManualApproval(
+						"write_to_file",
+						activeIntentId || "NONE",
+						block.params.path,
+					)
+					if (!isApproved) {
+						pushToolResult("USER REJECTION: Permission denied.")
+						break
+					}
+					// --- GOVERNANCE GUARD END ---
+
 					await checkpointSaveAndMark(cline)
 					await writeToFileTool.handle(cline, block as ToolUse<"write_to_file">, {
 						askApproval,
@@ -684,6 +723,7 @@ export async function presentAssistantMessage(cline: Task) {
 						pushToolResult,
 					})
 					break
+				}
 				case "update_todo_list":
 					await updateTodoListTool.handle(cline, block as ToolUse<"update_todo_list">, {
 						askApproval,
@@ -849,6 +889,38 @@ export async function presentAssistantMessage(cline: Task) {
 						pushToolResult,
 					})
 					break
+
+				// --- GOVERNANCE HANDSHAKE CASE (NOW CORRECTLY PLACED) ---
+				case "select_active_intent": {
+					if (block.partial) break
+
+					try {
+						// We use 'any' here to bypass the broken imports from @roo-code/types
+						const params = (block as any).nativeArgs || (block as any).params
+						const intentId = params?.intent_id
+
+						if (!intentId) {
+							pushToolResult("Error: intent_id is required.")
+							break
+						}
+
+						// Apply the state change directly to the 'cline' object
+						;(cline as any).activeIntentId = intentId
+
+						// Force a console log so we can see it in the debug console
+						console.log(`[GOVERNANCE] Handshake successful. Intent: ${intentId}`)
+
+						pushToolResult(`SUCCESS: Intent "${intentId}" activated. Enforcement is now online.`)
+
+						// This is the trigger that tells Roo the tool finished
+						cline.didAlreadyUseTool = true
+					} catch (error: any) {
+						await handleError("activating intent", error)
+					}
+					break
+				}
+				// --- END GOVERNANCE HANDSHAKE ---
+
 				default: {
 					// Handle unknown/invalid tool names OR custom tools
 					// This is critical for native tool calling where every tool_use MUST have a tool_result
