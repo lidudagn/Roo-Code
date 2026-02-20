@@ -26,6 +26,9 @@ importers:
       minimatch:
         specifier: ^10.2.2
         version: 10.2.2
+      openai:
+        specifier: ^5.12.2
+        version: 5.12.2(ws@8.18.3)(zod@3.25.76)
     devDependencies:
       '@changesets/cli':
         specifier: ^2.27.10

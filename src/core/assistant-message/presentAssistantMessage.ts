@@ -14,7 +14,7 @@ import type { ToolParamName, ToolResponse, ToolUse, McpToolUse } from "../../sha
 
 import { AskIgnoredError } from "../task/AskIgnoredError"
 import { Task } from "../task/Task"
-
+import * as fs from "fs/promises";
 import { listFilesTool } from "../tools/ListFilesTool"
 import { readFileTool } from "../tools/ReadFileTool"
 import { readCommandOutputTool } from "../tools/ReadCommandOutputTool"
@@ -42,6 +42,8 @@ import { codebaseSearchTool } from "../tools/CodebaseSearchTool"
 import { formatResponse } from "../prompts/responses"
 import { sanitizeToolUseId } from "../../utils/tool-id"
 import { enforceScope, loadIntentScope, requestManualApproval, classifyAction } from "../../hooks/scopeEnforcer"
+import path from "path"
+import { intentHook ,engine} from "../../hooks"
 /**
  * Processes and presents assistant message content to the user interface.
  *
@@ -59,6 +61,27 @@ import { enforceScope, loadIntentScope, requestManualApproval, classifyAction } 
  * as it becomes available.
  */
 
+/**
+ * Unified Governance Guard
+ * Checks Phase 1 (Intent) and Phase 2 (Scope)
+ */ 
+async function resolveProjectRoot(startPath: string): Promise<string> {
+    let current = startPath;
+    while (current !== path.dirname(current)) {
+        const orchestrationPath = path.join(current, ".orchestration");
+        try {
+            await fs.stat(orchestrationPath);
+            return current; // Found it!
+        } catch {
+            current = path.dirname(current);
+        }
+    }
+    return startPath; 
+}
+
+async function runGovernanceGuard(toolName: string, params: any, cline: any): Promise<{ allowed: boolean; error?: string }> {
+    return await engine.executePreHooks(toolName, params, cline);
+}
 export async function presentAssistantMessage(cline: Task) {
 	if (cline.abort) {
 		throw new Error(`[Task#presentAssistantMessage] task ${cline.taskId}.${cline.instanceId} aborted`)
@@ -688,306 +711,365 @@ export async function presentAssistantMessage(cline: Task) {
 				}
 			}
 
-			switch (block.name) {
-				case "write_to_file": {
-					if (block.partial) break
+		switch (block.name) {
+ case "write_to_file": {
+    if (block.partial) break;
 
-					// --- GOVERNANCE GUARD START ---
-					const activeIntentId = (cline as any).activeIntentId
-					const workspaceRoot = vscode.workspace.workspaceFolders?.[0].uri.fsPath || ""
-					const activeIntent = activeIntentId
-						? await loadIntentScope(workspaceRoot, activeIntentId)
-						: undefined
+    const guard = await runGovernanceGuard("write_to_file", block.params, cline);
+    if (!guard.allowed) {
+        // Show error directly in UI (this is what user sees)
+        await cline.say("error", guard.error || "ERROR: Cannot write file - No active intent selected. Operation blocked.");
+        
+        // 🚨 CRITICAL: Tell system we're done
+        cline.didAlreadyUseTool = true;      // Signals tool was used
+        cline.userMessageContentReady = true; // Forces turn to end
+        
+        // NO tool result at all - this prevents LLM response
+        break;
+    }
 
-					const check = await enforceScope("write_to_file", block.params, activeIntent)
-					if (!check.allowed) {
-						pushToolResult(`GOVERNANCE ERROR: ${check.reason}`)
-						break
-					}
+    await checkpointSaveAndMark(cline);
+    await writeToFileTool.handle(cline, block as ToolUse<"write_to_file">, {
+        askApproval,
+        handleError,
+        pushToolResult,
+    });
+    break;
+}
 
-					const isApproved = await requestManualApproval(
-						"write_to_file",
-						activeIntentId || "NONE",
-						block.params.path,
-					)
-					if (!isApproved) {
-						pushToolResult("USER REJECTION: Permission denied.")
-						break
-					}
-					// --- GOVERNANCE GUARD END ---
+    case "update_todo_list":
+        await updateTodoListTool.handle(cline, block as ToolUse<"update_todo_list">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
 
-					await checkpointSaveAndMark(cline)
-					await writeToFileTool.handle(cline, block as ToolUse<"write_to_file">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				}
-				case "update_todo_list":
-					await updateTodoListTool.handle(cline, block as ToolUse<"update_todo_list">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "apply_diff":
-					await checkpointSaveAndMark(cline)
-					await applyDiffToolClass.handle(cline, block as ToolUse<"apply_diff">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "edit":
-				case "search_and_replace":
-					await checkpointSaveAndMark(cline)
-					await editTool.handle(cline, block as ToolUse<"edit">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "search_replace":
-					await checkpointSaveAndMark(cline)
-					await searchReplaceTool.handle(cline, block as ToolUse<"search_replace">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "edit_file":
-					await checkpointSaveAndMark(cline)
-					await editFileTool.handle(cline, block as ToolUse<"edit_file">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "apply_patch":
-					await checkpointSaveAndMark(cline)
-					await applyPatchTool.handle(cline, block as ToolUse<"apply_patch">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "read_file":
-					// Type assertion is safe here because we're in the "read_file" case
-					await readFileTool.handle(cline, block as ToolUse<"read_file">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "list_files":
-					await listFilesTool.handle(cline, block as ToolUse<"list_files">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "codebase_search":
-					await codebaseSearchTool.handle(cline, block as ToolUse<"codebase_search">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "search_files":
-					await searchFilesTool.handle(cline, block as ToolUse<"search_files">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "execute_command":
-					await executeCommandTool.handle(cline, block as ToolUse<"execute_command">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "read_command_output":
-					await readCommandOutputTool.handle(cline, block as ToolUse<"read_command_output">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "use_mcp_tool":
-					await useMcpToolTool.handle(cline, block as ToolUse<"use_mcp_tool">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "access_mcp_resource":
-					await accessMcpResourceTool.handle(cline, block as ToolUse<"access_mcp_resource">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "ask_followup_question":
-					await askFollowupQuestionTool.handle(cline, block as ToolUse<"ask_followup_question">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "switch_mode":
-					await switchModeTool.handle(cline, block as ToolUse<"switch_mode">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "new_task":
-					await checkpointSaveAndMark(cline)
-					await newTaskTool.handle(cline, block as ToolUse<"new_task">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-						toolCallId: block.id,
-					})
-					break
-				case "attempt_completion": {
-					const completionCallbacks: AttemptCompletionCallbacks = {
-						askApproval,
-						handleError,
-						pushToolResult,
-						askFinishSubTaskApproval,
-						toolDescription,
-					}
-					await attemptCompletionTool.handle(
-						cline,
-						block as ToolUse<"attempt_completion">,
-						completionCallbacks,
-					)
-					break
-				}
-				case "run_slash_command":
-					await runSlashCommandTool.handle(cline, block as ToolUse<"run_slash_command">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "skill":
-					await skillTool.handle(cline, block as ToolUse<"skill">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "generate_image":
-					await checkpointSaveAndMark(cline)
-					await generateImageTool.handle(cline, block as ToolUse<"generate_image">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
+    case "apply_diff": {
+        if (block.partial) break;
 
-				// --- GOVERNANCE HANDSHAKE CASE (NOW CORRECTLY PLACED) ---
-				case "select_active_intent": {
-					if (block.partial) break
+        const guard = await runGovernanceGuard("apply_diff", block.params, cline);
+        if (!guard.allowed) {
+            // Show error directly in UI
+            await cline.say("error", guard.error || "ERROR: Cannot apply diff - No active intent selected. Operation blocked.");
+            
+            // Send empty tool result to prevent LLM response
+            cline.pushToolResultToUserContent({
+                type: "tool_result",
+                tool_use_id: sanitizeToolUseId(block.id),
+                content: "",
+                is_error: true,
+            });
+            break;
+        }
 
-					try {
-						// We use 'any' here to bypass the broken imports from @roo-code/types
-						const params = (block as any).nativeArgs || (block as any).params
-						const intentId = params?.intent_id
+        await checkpointSaveAndMark(cline);
+        await applyDiffToolClass.handle(cline, block as ToolUse<"apply_diff">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
+    }
 
-						if (!intentId) {
-							pushToolResult("Error: intent_id is required.")
-							break
-						}
+    case "edit":
+    case "search_and_replace":
+        await checkpointSaveAndMark(cline);
+        await editTool.handle(cline, block as ToolUse<"edit">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
 
-						// Apply the state change directly to the 'cline' object
-						;(cline as any).activeIntentId = intentId
+    case "search_replace":
+        await checkpointSaveAndMark(cline);
+        await searchReplaceTool.handle(cline, block as ToolUse<"search_replace">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
 
-						// Force a console log so we can see it in the debug console
-						console.log(`[GOVERNANCE] Handshake successful. Intent: ${intentId}`)
+    case "edit_file":
+        await checkpointSaveAndMark(cline);
+        await editFileTool.handle(cline, block as ToolUse<"edit_file">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
 
-						pushToolResult(`SUCCESS: Intent "${intentId}" activated. Enforcement is now online.`)
+    case "apply_patch":
+        await checkpointSaveAndMark(cline);
+        await applyPatchTool.handle(cline, block as ToolUse<"apply_patch">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
 
-						// This is the trigger that tells Roo the tool finished
-						cline.didAlreadyUseTool = true
-					} catch (error: any) {
-						await handleError("activating intent", error)
-					}
-					break
-				}
-				// --- END GOVERNANCE HANDSHAKE ---
+    case "read_file":
+        await readFileTool.handle(cline, block as ToolUse<"read_file">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
 
-				default: {
-					// Handle unknown/invalid tool names OR custom tools
-					// This is critical for native tool calling where every tool_use MUST have a tool_result
+    case "list_files":
+        await listFilesTool.handle(cline, block as ToolUse<"list_files">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
 
-					// CRITICAL: Don't process partial blocks for unknown tools - just let them stream in.
-					// If we try to show errors for partial blocks, we'd show the error on every streaming chunk,
-					// creating a loop that appears to freeze the extension. Only handle complete blocks.
-					if (block.partial) {
-						break
-					}
+    case "codebase_search":
+        await codebaseSearchTool.handle(cline, block as ToolUse<"codebase_search">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
 
-					const customTool = stateExperiments?.customTools ? customToolRegistry.get(block.name) : undefined
+    case "search_files":
+        await searchFilesTool.handle(cline, block as ToolUse<"search_files">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
 
-					if (customTool) {
-						try {
-							let customToolArgs
+    case "execute_command": {
+        if (block.partial) break;
 
-							if (customTool.parameters) {
-								try {
-									customToolArgs = customTool.parameters.parse(block.nativeArgs || block.params || {})
-								} catch (parseParamsError) {
-									const message = `Custom tool "${block.name}" argument validation failed: ${parseParamsError.message}`
-									console.error(message)
-									cline.consecutiveMistakeCount++
-									await cline.say("error", message)
-									pushToolResult(formatResponse.toolError(message))
-									break
-								}
-							}
+        const guard = await runGovernanceGuard("execute_command", block.params, cline);
+        if (!guard.allowed) {
+            // Show error directly in UI
+            await cline.say("error", guard.error || "ERROR: Cannot execute command - No active intent selected. Operation blocked.");
+            
+            // Send empty tool result to prevent LLM response
+            cline.pushToolResultToUserContent({
+                type: "tool_result",
+                tool_use_id: sanitizeToolUseId(block.id),
+                content: "",
+                is_error: true,
+            });
+            break;
+        }
 
-							const result = await customTool.execute(customToolArgs, {
-								mode: mode ?? defaultModeSlug,
-								task: cline,
-							})
+        await executeCommandTool.handle(cline, block as ToolUse<"execute_command">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
+    }
 
-							console.log(
-								`${customTool.name}.execute(): ${JSON.stringify(customToolArgs)} -> ${JSON.stringify(result)}`,
-							)
+    case "read_command_output":
+        await readCommandOutputTool.handle(cline, block as ToolUse<"read_command_output">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
 
-							pushToolResult(result)
-							cline.consecutiveMistakeCount = 0
-						} catch (executionError: any) {
-							cline.consecutiveMistakeCount++
-							// Record custom tool error with static name
-							cline.recordToolError("custom_tool", executionError.message)
-							await handleError(`executing custom tool "${block.name}"`, executionError)
-						}
+    case "use_mcp_tool":
+        await useMcpToolTool.handle(cline, block as ToolUse<"use_mcp_tool">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
 
-						break
-					}
+    case "access_mcp_resource":
+        await accessMcpResourceTool.handle(cline, block as ToolUse<"access_mcp_resource">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
 
-					// Not a custom tool - handle as unknown tool error
-					const errorMessage = `Unknown tool "${block.name}". This tool does not exist. Please use one of the available tools.`
-					cline.consecutiveMistakeCount++
-					cline.recordToolError(block.name as ToolName, errorMessage)
-					await cline.say("error", t("tools:unknownToolError", { toolName: block.name }))
-					// Push tool_result directly WITHOUT setting didAlreadyUseTool
-					// This prevents the stream from being interrupted with "Response interrupted by tool use result"
-					cline.pushToolResultToUserContent({
-						type: "tool_result",
-						tool_use_id: sanitizeToolUseId(toolCallId),
-						content: formatResponse.toolError(errorMessage),
-						is_error: true,
-					})
-					break
-				}
-			}
+    case "ask_followup_question":
+        await askFollowupQuestionTool.handle(cline, block as ToolUse<"ask_followup_question">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
+
+    case "switch_mode":
+        await switchModeTool.handle(cline, block as ToolUse<"switch_mode">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
+
+    case "new_task":
+        await checkpointSaveAndMark(cline);
+        await newTaskTool.handle(cline, block as ToolUse<"new_task">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+            toolCallId: block.id,
+        });
+        break;
+
+    case "attempt_completion": {
+        const completionCallbacks: AttemptCompletionCallbacks = {
+            askApproval,
+            handleError,
+            pushToolResult,
+            askFinishSubTaskApproval,
+            toolDescription,
+        };
+        await attemptCompletionTool.handle(
+            cline,
+            block as ToolUse<"attempt_completion">,
+            completionCallbacks,
+        );
+        break;
+    }
+
+    case "run_slash_command":
+        await runSlashCommandTool.handle(cline, block as ToolUse<"run_slash_command">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
+
+    case "skill":
+        await skillTool.handle(cline, block as ToolUse<"skill">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
+
+    case "generate_image":
+        await checkpointSaveAndMark(cline);
+        await generateImageTool.handle(cline, block as ToolUse<"generate_image">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
+
+    // --- GOVERNANCE HANDSHAKE CASES ---
+    case "select_active_intent": {
+        if (block.partial) break;
+        
+        try {
+            const params = (block as any).nativeArgs || (block as any).params;
+            const intentId = params?.intent_id;
+            
+            if (!intentId) {
+                pushToolResult("Error: intent_id is required.");
+                break;
+            }
+            
+            const intentHook = engine.getIntentHook();
+            if (!intentHook) {
+                pushToolResult("Error: Intent hook not initialized");
+                break;
+            }
+            
+            const result = await intentHook.handleSelectIntent(intentId);
+            
+            if (!result.success) {
+                const errorMessage = result.error || "Unknown error activating intent";
+                pushToolResult(errorMessage);
+                break;
+            }
+            
+            // Success path
+            (cline as any).activeIntentId = intentId;
+            pushToolResult(`✅ Intent "${intentId}" activated.`);
+            
+            if (result.context) {
+                (cline as any).pendingContext = result.context;
+            }
+            
+            cline.didAlreadyUseTool = true;
+            
+        } catch (error: any) {
+            const errorMessage = error?.message || "Error activating intent";
+            pushToolResult(errorMessage);
+            await handleError("activating intent", error);
+        }
+        break;
+    }
+
+    case "clear_active_intent": {
+        intentHook.clearIntent();
+        (cline as any).activeIntentId = null;
+        pushToolResult("✅ Intent cleared.");
+        break;
+    }
+    // --- END GOVERNANCE HANDSHAKE ---
+
+    default: {
+        if (block.partial) {
+            break;
+        }
+
+        const customTool = stateExperiments?.customTools ? customToolRegistry.get(block.name) : undefined;
+
+        if (customTool) {
+            try {
+                let customToolArgs;
+
+                if (customTool.parameters) {
+                    try {
+                        customToolArgs = customTool.parameters.parse(block.nativeArgs || block.params || {});
+                    } catch (parseParamsError) {
+                        const message = `Custom tool "${block.name}" argument validation failed: ${parseParamsError.message}`;
+                        console.error(message);
+                        cline.consecutiveMistakeCount++;
+                        await cline.say("error", message);
+                        pushToolResult(formatResponse.toolError(message));
+                        break;
+                    }
+                }
+
+                const result = await customTool.execute(customToolArgs, {
+                    mode: mode ?? defaultModeSlug,
+                    task: cline,
+                });
+
+                console.log(
+                    `${customTool.name}.execute(): ${JSON.stringify(customToolArgs)} -> ${JSON.stringify(result)}`,
+                );
+
+                pushToolResult(result);
+                cline.consecutiveMistakeCount = 0;
+            } catch (executionError: any) {
+                cline.consecutiveMistakeCount++;
+                cline.recordToolError("custom_tool", executionError.message);
+                await handleError(`executing custom tool "${block.name}"`, executionError);
+            }
+
+            break;
+        }
+
+        // Not a custom tool - handle as unknown tool error
+        const errorMessage = `Unknown tool "${block.name}". This tool does not exist. Please use one of the available tools.`;
+        cline.consecutiveMistakeCount++;
+        cline.recordToolError(block.name as ToolName, errorMessage);
+        await cline.say("error", t("tools:unknownToolError", { toolName: block.name }));
+        
+        cline.pushToolResultToUserContent({
+            type: "tool_result",
+            tool_use_id: sanitizeToolUseId(toolCallId),
+            content: "",  // Empty to prevent LLM response
+            is_error: true,
+        });
+        break;
+    }
+}
 
 			break
 		}

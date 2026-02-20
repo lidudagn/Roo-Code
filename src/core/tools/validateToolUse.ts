@@ -48,6 +48,33 @@ export function isDestructiveTool(toolName: ToolName): boolean {
 	return DESTRUCTIVE_TOOLS.includes(toolName)
 }
 
+
+
+
+
+const INTENT_IGNORE_LIST = [
+    ".orchestration/**",
+    ".env",
+    ".git/**",
+    "node_modules/**"
+]
+
+function isPathProtected(filePath: string): { protected: boolean; reason?: string } {
+    const normalizedPath = filePath.replace(/\\/g, "/")
+    
+    const isIgnored = INTENT_IGNORE_LIST.some(pattern => 
+        minimatch(normalizedPath, pattern, { dot: true, matchBase: true })
+    )
+
+    if (isIgnored) {
+        return {
+            protected: true,
+            reason: `🔒 CONSTITUTIONAL BLOCK: The path "${normalizedPath}" is a protected system resource and cannot be modified by the AI under any intent.`
+        }
+    }
+    return { protected: false }
+}
+
 // ============================================================================
 // PHASE 1 GATE: INTENT VALIDATION
 // ============================================================================
@@ -231,26 +258,36 @@ export async function validateScopeForTool(
  * @returns Validation result
  */
 export async function validateGovernance(
-	toolName: ToolName,
-	activeIntentId: string | null,
-	params?: Record<string, unknown>,
-	workspaceRoot?: string,
+    toolName: ToolName,
+    activeIntentId: string | null,
+    params?: Record<string, unknown>,
+    workspaceRoot?: string,
 ): Promise<{ allowed: boolean; reason?: string }> {
-	// PHASE 1 GATE: Intent validation
-	const intentValidation = validateIntentForTool(toolName, activeIntentId)
-	if (!intentValidation.allowed) {
-		return intentValidation
-	}
+    
+    // 👇 NEW: CONSTITUTIONAL GATE (Check this first!)
+    const filePath = extractFilePathFromParams(toolName, params)
+    if (filePath && isDestructiveTool(toolName)) {
+        const protection = isPathProtected(filePath)
+        if (protection.protected) {
+            return { allowed: false, reason: protection.reason }
+        }
+    }
 
-	// If we have an active intent and workspace root, do Phase 2 scope validation
-	if (activeIntentId && workspaceRoot) {
-		const scopeValidation = await validateScopeForTool(toolName, params, activeIntentId, workspaceRoot)
-		if (!scopeValidation.allowed) {
-			return scopeValidation
-		}
-	}
+    // PHASE 1 GATE: Intent validation (Existing)
+    const intentValidation = validateIntentForTool(toolName, activeIntentId)
+    if (!intentValidation.allowed) {
+        return intentValidation
+    }
 
-	return { allowed: true }
+    // PHASE 2 GATE: Scope validation (Existing)
+    if (activeIntentId && workspaceRoot) {
+        const scopeValidation = await validateScopeForTool(toolName, params, activeIntentId, workspaceRoot)
+        if (!scopeValidation.allowed) {
+            return scopeValidation
+        }
+    }
+
+    return { allowed: true }
 }
 
 // ============================================================================

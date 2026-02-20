@@ -7,6 +7,8 @@
 // 	}
 // }
 // src/hooks/scopeEnforcer.ts
+
+
 import * as vscode from "vscode"
 import * as path from "path"
 import * as fs from "fs/promises"
@@ -25,24 +27,50 @@ export interface IntentScope {
 /**
  * 1. YAML Loader: Fetches the formal intent definition from the registry.
  */
-export async function loadIntentScope(workspaceRoot: string, intentId: string): Promise<IntentScope | undefined> {
-	try {
-		const filePath = path.join(workspaceRoot, ".orchestration", "active_intents.yaml")
-		const fileContents = await fs.readFile(filePath, "utf8")
-		const data = yaml.load(fileContents) as any
-
-		const intent = data.intents.find((i: any) => i.id === intentId)
-
-		if (intent) {
-			return {
-				intent_id: intent.id,
-				owned_scope: intent.owned_scope || [],
-			}
+async function resolveProjectRoot(startPath: string): Promise<string> {
+	let current = startPath;
+	while (current !== path.dirname(current)) {
+		const orchestrationPath = path.join(current, ".orchestration");
+		try {
+			await fs.stat(orchestrationPath);
+			return current; // Found it!
+		} catch {
+			current = path.dirname(current);
 		}
-	} catch (error) {
-		console.error("[GOVERNANCE] Error loading intent registry:", error)
 	}
-	return undefined
+	return startPath; 
+}
+
+export async function loadIntentScope(workspaceRoot: string, intentId: string): Promise<IntentScope | undefined> {
+    try {
+        // 🛡️ STEP 1: Use the bulletproof root resolver
+        const projectRoot = await resolveProjectRoot(workspaceRoot);
+        const filePath = path.join(projectRoot, ".orchestration", "active_intents.yaml");
+
+        const fileContents = await fs.readFile(filePath, "utf8");
+        const data = yaml.load(fileContents) as any;
+
+        // STEP 2: Use the correct key from your YAML
+        const intentsList = data.active_intents || []; 
+        const intent = intentsList.find((i: any) => i.id === intentId);
+
+        if (intent) {
+            return {
+                intent_id: intent.id,
+                owned_scope: intent.owned_scope || [],
+            };
+        } else {
+            console.warn(`[GOVERNANCE] Intent ID "${intentId}" not found in YAML.`);
+        }
+    } catch (error: any) {
+        if (error.code === "ENOENT") {
+            // Log the ACTUAL path being attempted for debugging
+            console.error("[GOVERNANCE] Registry not found. Check pathing logic.");
+        } else {
+            console.error("[GOVERNANCE] Error loading intent registry:", error);
+        }
+    }
+    return undefined;
 }
 
 /**

@@ -18,7 +18,7 @@ import {
 // --- GOVERNANCE REUSE ---
 // Importing your existing tool definition from the orchestration folder
 // @ts-ignore
-import { selectActiveIntentTool } from "../../orchestration/intentSelectionTool"
+import { selectActiveIntentTool } from "../../../.orchestration/intentSelectionTool"
 
 interface BuildToolsOptions {
 	provider: ClineProvider

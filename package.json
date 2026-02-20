@@ -75,6 +75,7 @@
 	},
 	"dependencies": {
 		"js-yaml": "^4.1.1",
-		"minimatch": "^10.2.2"
+		"minimatch": "^10.2.2",
+		"openai": "^5.12.2"
 	}
 }
