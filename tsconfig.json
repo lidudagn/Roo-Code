@@ -4,5 +4,12 @@
 		"types": ["node"]
 	},
 	"exclude": ["node_modules"],
-	"include": ["scripts/*.ts"]
+	"include": [
+		"scripts/*.ts",
+		"src/core/**/*.ts",
+		"src/shared/**/*.ts",
+		"src/hooks/**/*.ts",
+		"src/utils/**/*.ts",
+		"src/services/**/*.ts"
+	]
 }

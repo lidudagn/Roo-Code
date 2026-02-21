@@ -1,3 +1,4 @@
+import * as vscode from "vscode"
 import { serializeError } from "serialize-error"
 import { Anthropic } from "@anthropic-ai/sdk"
 
@@ -5,15 +6,16 @@ import type { ToolName, ClineAsk, ToolProgressStatus } from "@roo-code/types"
 import { ConsecutiveMistakeError, TelemetryEventName } from "@roo-code/types"
 import { TelemetryService } from "@roo-code/telemetry"
 import { customToolRegistry } from "@roo-code/core"
-
+import * as crypto from 'crypto';
+import { OptimisticLocking } from '../../utils/locking';
 import { t } from "../../i18n"
-
+import { TraceService } from '../../services/trace/TraceService';
 import { defaultModeSlug, getModeBySlug } from "../../shared/modes"
 import type { ToolParamName, ToolResponse, ToolUse, McpToolUse } from "../../shared/tools"
-
+import { recordLessonTool } from "../tools/RecordLessonTool";
 import { AskIgnoredError } from "../task/AskIgnoredError"
 import { Task } from "../task/Task"
-
+import * as fs from "fs/promises";
 import { listFilesTool } from "../tools/ListFilesTool"
 import { readFileTool } from "../tools/ReadFileTool"
 import { readCommandOutputTool } from "../tools/ReadCommandOutputTool"
@@ -40,7 +42,10 @@ import { codebaseSearchTool } from "../tools/CodebaseSearchTool"
 
 import { formatResponse } from "../prompts/responses"
 import { sanitizeToolUseId } from "../../utils/tool-id"
-
+import { enforceScope, loadIntentScope, requestManualApproval, classifyAction, runGovernanceGuard } from "../../hooks/scopeEnforcer"
+import path from "path"
+import { intentHook ,engine} from "../../hooks"
+import { IntentMapService } from "../../services/IntentMap/IntentMapService"
 /**
  * Processes and presents assistant message content to the user interface.
  *
@@ -58,6 +63,27 @@ import { sanitizeToolUseId } from "../../utils/tool-id"
  * as it becomes available.
  */
 
+/**
+ * Unified Governance Guard
+ * Checks Phase 1 (Intent) and Phase 2 (Scope)
+ */ 
+async function resolveProjectRoot(startPath: string): Promise<string> {
+    let current = startPath;
+    while (current !== path.dirname(current)) {
+        const orchestrationPath = path.join(current, ".orchestration");
+        try {
+            await fs.stat(orchestrationPath);
+            return current; // Found it!
+        } catch {
+            current = path.dirname(current);
+        }
+    }
+    return startPath; 
+}
+
+// async function runGovernanceGuard(toolName: string, params: any, cline: any): Promise<{ allowed: boolean; error?: string }> {
+//     return await engine.executePreHooks(toolName, params, cline);
+// }
 export async function presentAssistantMessage(cline: Task) {
 	if (cline.abort) {
 		throw new Error(`[Task#presentAssistantMessage] task ${cline.taskId}.${cline.instanceId} aborted`)
@@ -383,6 +409,11 @@ export async function presentAssistantMessage(cline: Task) {
 						return `[${block.name} for '${block.params.skill}'${block.params.args ? ` with args: ${block.params.args}` : ""}]`
 					case "generate_image":
 						return `[${block.name} for '${block.params.path}']`
+
+					// --- GOVERNANCE TOOL DESCRIPTION ---
+					case "select_active_intent":
+						return `[${block.name} for intent '${block.params.intent_id}']`
+
 					default:
 						return `[${block.name}]`
 				}
@@ -415,10 +446,16 @@ export async function presentAssistantMessage(cline: Task) {
 			//
 			// This avoids executing an invalid tool_use block and prevents duplicate/fragmented
 			// error reporting.
+			// If this is a native tool call but the parser couldn't construct nativeArgs
 			if (!block.partial) {
 				const customTool = stateExperiments?.customTools ? customToolRegistry.get(block.name) : undefined
 				const isKnownTool = isValidToolName(String(block.name), stateExperiments)
-				if (isKnownTool && !block.nativeArgs && !customTool) {
+
+				// 🚫 EXCEPTION FOR OUR GOVERNANCE TOOL
+				if (block.name === "select_active_intent") {
+					// Skip validation for our tool - it will be handled in the switch
+					console.log("🔓 Bypassing nativeArgs check for select_active_intent")
+				} else if (isKnownTool && !block.nativeArgs && !customTool) {
 					const errorMessage =
 						`Invalid tool call for '${block.name}': missing nativeArgs. ` +
 						`This usually means the model streamed invalid or incomplete arguments and the call could not be finalized.`
@@ -430,8 +467,6 @@ export async function presentAssistantMessage(cline: Task) {
 						// Best-effort only
 					}
 
-					// Push tool_result directly without setting didAlreadyUseTool so streaming can
-					// continue gracefully.
 					cline.pushToolResultToUserContent({
 						type: "tool_result",
 						tool_use_id: sanitizeToolUseId(toolCallId),
@@ -594,7 +629,8 @@ export async function presentAssistantMessage(cline: Task) {
 							{} as Record<string, boolean>,
 						) ?? {}
 
-					validateToolUse(
+					// 👇 UPDATED: Add governance parameters
+					await validateToolUse(
 						block.name as ToolName,
 						mode ?? defaultModeSlug,
 						customModes ?? [],
@@ -602,10 +638,12 @@ export async function presentAssistantMessage(cline: Task) {
 						block.params,
 						stateExperiments,
 						includedTools,
+						(cline as any).activeIntentId, // 👈 Add active intent
+						vscode.workspace.workspaceFolders?.[0].uri.fsPath, // 👈 Add workspace root
 					)
 				} catch (error) {
 					cline.consecutiveMistakeCount++
-					// For validation errors (unknown tool, tool not allowed for mode), we need to:
+					// For validation errors (unknown tool, tool not allowed for mode, OR GOVERNANCE BLOCK), we need to:
 					// 1. Send a tool_result with the error (required for native tool calling)
 					// 2. NOT set didAlreadyUseTool = true (the tool was never executed, just failed validation)
 					// This prevents the stream from being interrupted with "Response interrupted by tool use result"
@@ -675,247 +713,501 @@ export async function presentAssistantMessage(cline: Task) {
 				}
 			}
 
-			switch (block.name) {
-				case "write_to_file":
-					await checkpointSaveAndMark(cline)
-					await writeToFileTool.handle(cline, block as ToolUse<"write_to_file">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "update_todo_list":
-					await updateTodoListTool.handle(cline, block as ToolUse<"update_todo_list">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "apply_diff":
-					await checkpointSaveAndMark(cline)
-					await applyDiffToolClass.handle(cline, block as ToolUse<"apply_diff">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "edit":
-				case "search_and_replace":
-					await checkpointSaveAndMark(cline)
-					await editTool.handle(cline, block as ToolUse<"edit">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "search_replace":
-					await checkpointSaveAndMark(cline)
-					await searchReplaceTool.handle(cline, block as ToolUse<"search_replace">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "edit_file":
-					await checkpointSaveAndMark(cline)
-					await editFileTool.handle(cline, block as ToolUse<"edit_file">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "apply_patch":
-					await checkpointSaveAndMark(cline)
-					await applyPatchTool.handle(cline, block as ToolUse<"apply_patch">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "read_file":
-					// Type assertion is safe here because we're in the "read_file" case
-					await readFileTool.handle(cline, block as ToolUse<"read_file">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "list_files":
-					await listFilesTool.handle(cline, block as ToolUse<"list_files">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "codebase_search":
-					await codebaseSearchTool.handle(cline, block as ToolUse<"codebase_search">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "search_files":
-					await searchFilesTool.handle(cline, block as ToolUse<"search_files">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "execute_command":
-					await executeCommandTool.handle(cline, block as ToolUse<"execute_command">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "read_command_output":
-					await readCommandOutputTool.handle(cline, block as ToolUse<"read_command_output">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "use_mcp_tool":
-					await useMcpToolTool.handle(cline, block as ToolUse<"use_mcp_tool">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "access_mcp_resource":
-					await accessMcpResourceTool.handle(cline, block as ToolUse<"access_mcp_resource">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "ask_followup_question":
-					await askFollowupQuestionTool.handle(cline, block as ToolUse<"ask_followup_question">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "switch_mode":
-					await switchModeTool.handle(cline, block as ToolUse<"switch_mode">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "new_task":
-					await checkpointSaveAndMark(cline)
-					await newTaskTool.handle(cline, block as ToolUse<"new_task">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-						toolCallId: block.id,
-					})
-					break
-				case "attempt_completion": {
-					const completionCallbacks: AttemptCompletionCallbacks = {
-						askApproval,
-						handleError,
-						pushToolResult,
-						askFinishSubTaskApproval,
-						toolDescription,
-					}
-					await attemptCompletionTool.handle(
-						cline,
-						block as ToolUse<"attempt_completion">,
-						completionCallbacks,
-					)
-					break
-				}
-				case "run_slash_command":
-					await runSlashCommandTool.handle(cline, block as ToolUse<"run_slash_command">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "skill":
-					await skillTool.handle(cline, block as ToolUse<"skill">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "generate_image":
-					await checkpointSaveAndMark(cline)
-					await generateImageTool.handle(cline, block as ToolUse<"generate_image">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				default: {
-					// Handle unknown/invalid tool names OR custom tools
-					// This is critical for native tool calling where every tool_use MUST have a tool_result
+switch (block.name) {
+case "write_to_file": {
+    if (block.partial) break;
+    
+    // Add locking before guard
+    const filePath = block.params?.path;
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const agentId = cline.taskId;
+    let oldContent: string | null = null;
+    let fileHash = 'new-file';
+    
+    if (workspaceRoot && filePath) {
+        const fullPath = path.isAbsolute(filePath) ? filePath : path.join(workspaceRoot, filePath);
+        try {
+            oldContent = await fs.readFile(fullPath, 'utf-8').catch(() => null);
+            if (oldContent) {
+                fileHash = crypto.createHash('sha256').update(oldContent).digest('hex');
+            }
+        } catch {}
+    }
+    
+    // Acquire lock
+    if (filePath && !OptimisticLocking.acquireLock(filePath, agentId, fileHash)) {
+        pushToolResult('⚠️ File is locked by another agent. Try again later.');
+        cline.didAlreadyUseTool = true;
+        cline.userMessageContentReady = true;
+        break;
+    }
+    
+    const guard = await runGovernanceGuard("write_to_file", block.params, cline);
+    if (!guard.allowed) {
+        OptimisticLocking.releaseLock(filePath, agentId);
+        await cline.say("error", guard.error);
+        cline.pushToolResultToUserContent({
+            type: "tool_result",
+            tool_use_id: sanitizeToolUseId(block.id),
+            content: guard.error,
+            is_error: true,
+        });
+        cline.didAlreadyUseTool = true;
+        cline.userMessageContentReady = true;
+        break;
+    }
+    
+    await checkpointSaveAndMark(cline);
+    await writeToFileTool.handle(cline, block as ToolUse<"write_to_file">, {
+        askApproval,
+        handleError,
+        pushToolResult,
+    });
+    
+    // Update lock with new content
+    if (workspaceRoot && filePath) {
+        const fullPath = path.isAbsolute(filePath) ? filePath : path.join(workspaceRoot, filePath);
+        const newContent = await fs.readFile(fullPath, 'utf-8').catch(() => null);
+        if (newContent) {
+            const newHash = crypto.createHash('sha256').update(newContent).digest('hex');
+            OptimisticLocking.updateLock(filePath, agentId, newHash);
+        }
+    }
+    
+    // 👇 ADD THIS - Update intent map
+ if (workspaceRoot && filePath && cline.getActiveIntentId()) {
+    try {
+        const fullPath = path.isAbsolute(filePath) ? filePath : path.join(workspaceRoot, filePath);
+        const intentMapService = IntentMapService.getInstance();
+        const intentId = cline.getActiveIntentId()!;
+        
+        // 👇 FIX: Calculate projectRoot HERE and pass it
+        const projectRoot = workspaceRoot.replace(/\/src$/, '');
+        const yamlPath = path.join(projectRoot, '.orchestration', 'active_intents.yaml');
+        let intentName = intentId;
+        
+        try {
+            const yamlContent = await fs.readFile(yamlPath, 'utf-8');
+            const { load } = require('js-yaml');
+            const data = load(yamlContent);
+            const intent = data.active_intents?.find((i: any) => i.id === intentId);
+            if (intent) {
+                intentName = intent.name;
+            }
+        } catch (e) {
+            console.error('[IntentMap] Failed to load intent name:', e);
+        }
+        
+        // 👇 FIX: Pass projectRoot instead of workspaceRoot
+        await intentMapService.addFileMapping(
+            projectRoot,  // Pass the fixed path!
+            intentId,
+            intentName,
+            fullPath
+        );
+        
+        console.log(`[IntentMap] ✅ Updated map for ${intentId} -> ${filePath}`);
+        
+    } catch (mapError) {
+        console.error('[IntentMap] Failed to update map:', mapError);
+    }
+}
+    break;
+}
+    case "update_todo_list":
+        await updateTodoListTool.handle(cline, block as ToolUse<"update_todo_list">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
 
-					// CRITICAL: Don't process partial blocks for unknown tools - just let them stream in.
-					// If we try to show errors for partial blocks, we'd show the error on every streaming chunk,
-					// creating a loop that appears to freeze the extension. Only handle complete blocks.
-					if (block.partial) {
-						break
-					}
+    case "apply_diff": {
+        if (block.partial) break;
 
-					const customTool = stateExperiments?.customTools ? customToolRegistry.get(block.name) : undefined
+        const guard = await runGovernanceGuard("apply_diff", block.params, cline);
+        if (!guard.allowed) {
+            await cline.say("error", guard.error || "ERROR: Cannot apply diff - No active intent selected. Operation blocked.");
+            
+            // ✅ FIXED: Send error message to model
+            cline.pushToolResultToUserContent({
+                type: "tool_result",
+                tool_use_id: sanitizeToolUseId(block.id),
+                content: guard.error || "ERROR: Cannot apply diff - No active intent selected. Operation blocked.",
+                is_error: true,
+            });
+            
+            cline.didAlreadyUseTool = true;
+            cline.userMessageContentReady = true;
+            break;
+        }
 
-					if (customTool) {
-						try {
-							let customToolArgs
+        await checkpointSaveAndMark(cline);
+        await applyDiffToolClass.handle(cline, block as ToolUse<"apply_diff">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
+    }
 
-							if (customTool.parameters) {
-								try {
-									customToolArgs = customTool.parameters.parse(block.nativeArgs || block.params || {})
-								} catch (parseParamsError) {
-									const message = `Custom tool "${block.name}" argument validation failed: ${parseParamsError.message}`
-									console.error(message)
-									cline.consecutiveMistakeCount++
-									await cline.say("error", message)
-									pushToolResult(formatResponse.toolError(message))
-									break
-								}
-							}
+    case "edit":
+    case "search_and_replace":
+    case "search_replace":
+    case "edit_file":
+    case "apply_patch": {
+        if (block.partial) break;
+        
+        const guard = await runGovernanceGuard(block.name, block.params, cline);
+        if (!guard.allowed) {
+            await cline.say("error", guard.error || `ERROR: Cannot ${block.name} - No active intent selected. Operation blocked.`);
+            
+            // ✅ FIXED: Send error message to model
+            cline.pushToolResultToUserContent({
+                type: "tool_result",
+                tool_use_id: sanitizeToolUseId(block.id),
+                content: guard.error || `ERROR: Cannot ${block.name} - No active intent selected. Operation blocked.`,
+                is_error: true,
+            });
+            
+            cline.didAlreadyUseTool = true;
+            cline.userMessageContentReady = true;
+            break;
+        }
+        
+        await checkpointSaveAndMark(cline);
+        
+        // Handle each tool type separately with proper casting
+        if (block.name === "edit") {
+            await editTool.handle(cline, block as ToolUse<"edit">, {
+                askApproval,
+                handleError,
+                pushToolResult,
+            });
+        } 
+        else if (block.name === "search_and_replace" || block.name === "search_replace") {
+            // For both search_and_replace and search_replace, use the same handler
+            await searchReplaceTool.handle(cline, block as unknown as ToolUse<typeof block.name>, {
+                askApproval,
+                handleError,
+                pushToolResult,
+            });
+        }
+        else if (block.name === "edit_file") {
+            await editFileTool.handle(cline, block as ToolUse<"edit_file">, {
+                askApproval,
+                handleError,
+                pushToolResult,
+            });
+        }
+        else if (block.name === "apply_patch") {
+            await applyPatchTool.handle(cline, block as ToolUse<"apply_patch">, {
+                askApproval,
+                handleError,
+                pushToolResult,
+            });
+        }
+        break;
+    }
 
-							const result = await customTool.execute(customToolArgs, {
-								mode: mode ?? defaultModeSlug,
-								task: cline,
-							})
+    case "read_file":
+        await readFileTool.handle(cline, block as ToolUse<"read_file">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
 
-							console.log(
-								`${customTool.name}.execute(): ${JSON.stringify(customToolArgs)} -> ${JSON.stringify(result)}`,
-							)
+    case "list_files":
+        await listFilesTool.handle(cline, block as ToolUse<"list_files">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
 
-							pushToolResult(result)
-							cline.consecutiveMistakeCount = 0
-						} catch (executionError: any) {
-							cline.consecutiveMistakeCount++
-							// Record custom tool error with static name
-							cline.recordToolError("custom_tool", executionError.message)
-							await handleError(`executing custom tool "${block.name}"`, executionError)
-						}
+    case "codebase_search":
+        await codebaseSearchTool.handle(cline, block as ToolUse<"codebase_search">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
 
-						break
-					}
+    case "search_files":
+        await searchFilesTool.handle(cline, block as ToolUse<"search_files">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
+case "record_lesson": {
+    if (block.partial) break;
+    
+    await recordLessonTool.handle(cline, block as ToolUse<"record_lesson">, {
+        askApproval,
+        handleError,
+        pushToolResult,
+    });
+    break;
+}
+    case "execute_command": {
+        if (block.partial) break;
 
-					// Not a custom tool - handle as unknown tool error
-					const errorMessage = `Unknown tool "${block.name}". This tool does not exist. Please use one of the available tools.`
-					cline.consecutiveMistakeCount++
-					cline.recordToolError(block.name as ToolName, errorMessage)
-					await cline.say("error", t("tools:unknownToolError", { toolName: block.name }))
-					// Push tool_result directly WITHOUT setting didAlreadyUseTool
-					// This prevents the stream from being interrupted with "Response interrupted by tool use result"
-					cline.pushToolResultToUserContent({
-						type: "tool_result",
-						tool_use_id: sanitizeToolUseId(toolCallId),
-						content: formatResponse.toolError(errorMessage),
-						is_error: true,
-					})
-					break
-				}
-			}
+        const guard = await runGovernanceGuard("execute_command", block.params, cline);
+        if (!guard.allowed) {
+            await cline.say("error", guard.error || "ERROR: Cannot execute command - No active intent selected. Operation blocked.");
+            
+            // ✅ FIXED: Send error message to model
+            cline.pushToolResultToUserContent({
+                type: "tool_result",
+                tool_use_id: sanitizeToolUseId(block.id),
+                content: guard.error || "ERROR: Cannot execute command - No active intent selected. Operation blocked.",
+                is_error: true,
+            });
+            
+            cline.didAlreadyUseTool = true;
+            cline.userMessageContentReady = true;
+            break;
+        }
+
+        await executeCommandTool.handle(cline, block as ToolUse<"execute_command">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
+    }
+
+    case "read_command_output":
+        await readCommandOutputTool.handle(cline, block as ToolUse<"read_command_output">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
+
+    case "use_mcp_tool":
+        await useMcpToolTool.handle(cline, block as ToolUse<"use_mcp_tool">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
+
+    case "access_mcp_resource":
+        await accessMcpResourceTool.handle(cline, block as ToolUse<"access_mcp_resource">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
+
+    case "ask_followup_question":
+        await askFollowupQuestionTool.handle(cline, block as ToolUse<"ask_followup_question">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
+
+    case "switch_mode":
+        await switchModeTool.handle(cline, block as ToolUse<"switch_mode">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
+
+    case "new_task": {
+        if (block.partial) break;
+        
+        const guard = await runGovernanceGuard("new_task", block.params, cline);
+        if (!guard.allowed) {
+            await cline.say("error", guard.error || "ERROR: Cannot create new task - No active intent selected. Operation blocked.");
+            
+            // ✅ FIXED: Send error message to model
+            cline.pushToolResultToUserContent({
+                type: "tool_result",
+                tool_use_id: sanitizeToolUseId(block.id),
+                content: guard.error || "ERROR: Cannot create new task - No active intent selected. Operation blocked.",
+                is_error: true,
+            });
+            
+            cline.didAlreadyUseTool = true;
+            cline.userMessageContentReady = true;
+            break;
+        }
+        
+        await checkpointSaveAndMark(cline);
+        await newTaskTool.handle(cline, block as ToolUse<"new_task">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+            toolCallId: block.id,
+        });
+        break;
+    }
+
+    case "attempt_completion": {
+        const completionCallbacks: AttemptCompletionCallbacks = {
+            askApproval,
+            handleError,
+            pushToolResult,
+            askFinishSubTaskApproval,
+            toolDescription,
+        };
+        await attemptCompletionTool.handle(
+            cline,
+            block as ToolUse<"attempt_completion">,
+            completionCallbacks,
+        );
+        break;
+    }
+
+    case "run_slash_command":
+        await runSlashCommandTool.handle(cline, block as ToolUse<"run_slash_command">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
+
+    case "skill":
+        await skillTool.handle(cline, block as ToolUse<"skill">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
+
+    case "generate_image":
+        await checkpointSaveAndMark(cline);
+        await generateImageTool.handle(cline, block as ToolUse<"generate_image">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
+        break;
+
+    // --- GOVERNANCE HANDSHAKE CASES ---
+ case "select_active_intent": {
+    if (block.partial) break;
+    
+    try {
+        const params = (block as any).nativeArgs || (block as any).params;
+        const intentId = params?.intent_id;
+        
+        if (!intentId) {
+            pushToolResult("Error: intent_id is required.");
+            break;
+        }
+        
+        const intentHook = engine.getIntentHook();
+        if (!intentHook) {
+            pushToolResult("Error: Intent hook not initialized");
+            break;
+        }
+        
+        const result = await intentHook.handleSelectIntent(intentId);
+        
+        if (!result.success) {
+            const errorMessage = result.error || "Unknown error activating intent";
+            pushToolResult(errorMessage);
+            break;
+        }
+        
+        // Success path
+cline.setActiveIntentId(intentId);
+        console.log(`✅ INTENT SET: activeIntentId = ${(cline as any).activeIntentId}`); // ADD THIS
+        
+        pushToolResult(`✅ Intent "${intentId}" activated.`);
+        
+        if (result.context) {
+            (cline as any).pendingContext = result.context;
+        }
+        
+        cline.didAlreadyUseTool = true;
+        
+    } catch (error: any) {
+        const errorMessage = error?.message || "Error activating intent";
+        pushToolResult(errorMessage);
+        await handleError("activating intent", error);
+    }
+    break;
+}
+
+   case "clear_active_intent": {
+    const intentHook = engine.getIntentHook();
+    if (intentHook) {
+        intentHook.clearIntent();
+    }
+    // ✅ USE THE SETTER METHOD
+    cline.setActiveIntentId(null);
+    pushToolResult("✅ Intent cleared.");
+    break;
+}
+    // --- END GOVERNANCE HANDSHAKE ---
+
+    default: {
+        if (block.partial) {
+            break;
+        }
+
+        const customTool = stateExperiments?.customTools ? customToolRegistry.get(block.name) : undefined;
+
+        if (customTool) {
+            try {
+                let customToolArgs;
+
+                if (customTool.parameters) {
+                    try {
+                        customToolArgs = customTool.parameters.parse(block.nativeArgs || block.params || {});
+                    } catch (parseParamsError) {
+                        const message = `Custom tool "${block.name}" argument validation failed: ${parseParamsError.message}`;
+                        console.error(message);
+                        cline.consecutiveMistakeCount++;
+                        await cline.say("error", message);
+                        pushToolResult(formatResponse.toolError(message));
+                        break;
+                    }
+                }
+
+                const result = await customTool.execute(customToolArgs, {
+                    mode: mode ?? defaultModeSlug,
+                    task: cline,
+                });
+
+                console.log(
+                    `${customTool.name}.execute(): ${JSON.stringify(customToolArgs)} -> ${JSON.stringify(result)}`,
+                );
+
+                pushToolResult(result);
+                cline.consecutiveMistakeCount = 0;
+            } catch (executionError: any) {
+                cline.consecutiveMistakeCount++;
+                cline.recordToolError("custom_tool", executionError.message);
+                await handleError(`executing custom tool "${block.name}"`, executionError);
+            }
+
+            break;
+        }
+
+        // Not a custom tool - handle as unknown tool error
+        const errorMessage = `Unknown tool "${block.name}". This tool does not exist. Please use one of the available tools.`;
+        cline.consecutiveMistakeCount++;
+        cline.recordToolError(block.name as ToolName, errorMessage);
+        await cline.say("error", t("tools:unknownToolError", { toolName: block.name }));
+        
+        cline.pushToolResultToUserContent({
+            type: "tool_result",
+            tool_use_id: sanitizeToolUseId(toolCallId),
+            content: errorMessage,  // ✅ FIXED: Send actual error message
+            is_error: true,
+        });
+        break;
+    }
+}
 
 			break
 		}

@@ -1,0 +1,20 @@
+active_intents:
+  - id: "INT-001"
+    name: "Weather API Implementation"
+    status: "ACTIVE"
+    owned_scope:
+      - "src/src/weather/**"
+    constraints:
+      - "Use OpenWeatherMap API"
+    acceptance_criteria:
+      - "Returns temperature for valid city"
+  
+  - id: "GOV-TEST-001"
+    name: "Verification of Governance"
+    status: "IN_PROGRESS"
+    owned_scope:
+      - "src/hooks/**"
+    constraints:
+      - "Must only use functional components"
+    acceptance_criteria:
+      - "Handshake successful"
