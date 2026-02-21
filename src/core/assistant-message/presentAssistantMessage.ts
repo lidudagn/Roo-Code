@@ -8,7 +8,7 @@ import { TelemetryService } from "@roo-code/telemetry"
 import { customToolRegistry } from "@roo-code/core"
 
 import { t } from "../../i18n"
-
+import { TraceService } from '../../services/trace/TraceService';
 import { defaultModeSlug, getModeBySlug } from "../../shared/modes"
 import type { ToolParamName, ToolResponse, ToolUse, McpToolUse } from "../../shared/tools"
 
@@ -712,35 +712,106 @@ export async function presentAssistantMessage(cline: Task) {
 			}
 
 switch (block.name) {
-    case "write_to_file": {
-        if (block.partial) break;
+    // case "write_to_file": {
+    //     if (block.partial) break;
 
-        const guard = await runGovernanceGuard("write_to_file", block.params, cline);
-        if (!guard.allowed) {
-            await cline.say("error", guard.error || "ERROR: Cannot write file - No active intent selected. Operation blocked.");
+    //     const guard = await runGovernanceGuard("write_to_file", block.params, cline);
+    //     if (!guard.allowed) {
+    //         await cline.say("error", guard.error || "ERROR: Cannot write file - No active intent selected. Operation blocked.");
             
-            // ✅ Send the error to the model so it knows what happened
-            cline.pushToolResultToUserContent({
-                type: "tool_result",
-                tool_use_id: sanitizeToolUseId(block.id),
-                content: guard.error || "ERROR: Cannot write file - No active intent selected. Operation blocked.",
-                is_error: true,
-            });
+    //         // ✅ Send the error to the model so it knows what happened
+    //         cline.pushToolResultToUserContent({
+    //             type: "tool_result",
+    //             tool_use_id: sanitizeToolUseId(block.id),
+    //             content: guard.error || "ERROR: Cannot write file - No active intent selected. Operation blocked.",
+    //             is_error: true,
+    //         });
             
-            cline.didAlreadyUseTool = true;
-            cline.userMessageContentReady = true;
-            break;
-        }
+    //         cline.didAlreadyUseTool = true;
+    //         cline.userMessageContentReady = true;
+    //         break;
+    //     }
 
-        await checkpointSaveAndMark(cline);
-        await writeToFileTool.handle(cline, block as ToolUse<"write_to_file">, {
-            askApproval,
-            handleError,
-            pushToolResult,
+    //     await checkpointSaveAndMark(cline);
+    //     await writeToFileTool.handle(cline, block as ToolUse<"write_to_file">, {
+    //         askApproval,
+    //         handleError,
+    //         pushToolResult,
+    //     });
+    //     break;
+    // }
+case "write_to_file": {
+    if (block.partial) break;
+    
+    const guard = await runGovernanceGuard("write_to_file", block.params, cline);
+    if (!guard.allowed) {
+        await cline.say("error", guard.error || "ERROR: Cannot write file - No active intent selected. Operation blocked.");
+        
+        cline.pushToolResultToUserContent({
+            type: "tool_result",
+            tool_use_id: sanitizeToolUseId(block.id),
+            content: guard.error || "ERROR: Cannot write file - No active intent selected. Operation blocked.",
+            is_error: true,
         });
+        
+        cline.didAlreadyUseTool = true;
+        cline.userMessageContentReady = true;
         break;
     }
-
+    
+    // 👇 NEW: Read old content if file exists (for classification)
+    let oldContent: string | null = null;
+    const filePath = block.params?.path;
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    
+    if (workspaceRoot && filePath) {
+        try {
+            const fullPath = path.isAbsolute(filePath) ? filePath : path.join(workspaceRoot, filePath);
+            oldContent = await fs.readFile(fullPath, 'utf-8').catch(() => null);
+        } catch {
+            // File doesn't exist yet - that's fine
+        }
+    }
+    
+    await checkpointSaveAndMark(cline);
+    await writeToFileTool.handle(cline, block as ToolUse<"write_to_file">, {
+        askApproval,
+        handleError,
+        pushToolResult,
+    });
+    
+    // 👇 NEW: Record trace after successful write
+    if (workspaceRoot && filePath && cline.getActiveIntentId()) {
+        try {
+            const fullPath = path.isAbsolute(filePath) ? filePath : path.join(workspaceRoot, filePath);
+            
+            // Read the content that was written
+            const newContent = await fs.readFile(fullPath, 'utf-8').catch(() => null);
+            
+            if (newContent) {
+                const modelInfo = cline.api.getModel();
+                const traceService = TraceService.getInstance();
+                
+                await traceService.recordFileWrite(
+                    workspaceRoot,
+                    fullPath,
+                    newContent,
+                    cline.getActiveIntentId()!,
+                    cline.taskId,
+                    modelInfo.id,
+                    oldContent
+                );
+                
+                console.log(`[TraceService] Trace recorded for ${filePath}`);
+            }
+        } catch (traceError) {
+            console.error('[TraceService] Failed to record trace:', traceError);
+            // Don't fail the main operation if tracing fails
+        }
+    }
+    
+    break;
+}
     case "update_todo_list":
         await updateTodoListTool.handle(cline, block as ToolUse<"update_todo_list">, {
             askApproval,
