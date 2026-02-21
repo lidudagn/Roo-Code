@@ -41,7 +41,7 @@ import { codebaseSearchTool } from "../tools/CodebaseSearchTool"
 
 import { formatResponse } from "../prompts/responses"
 import { sanitizeToolUseId } from "../../utils/tool-id"
-import { enforceScope, loadIntentScope, requestManualApproval, classifyAction } from "../../hooks/scopeEnforcer"
+import { enforceScope, loadIntentScope, requestManualApproval, classifyAction, runGovernanceGuard } from "../../hooks/scopeEnforcer"
 import path from "path"
 import { intentHook ,engine} from "../../hooks"
 /**
@@ -79,9 +79,9 @@ async function resolveProjectRoot(startPath: string): Promise<string> {
     return startPath; 
 }
 
-async function runGovernanceGuard(toolName: string, params: any, cline: any): Promise<{ allowed: boolean; error?: string }> {
-    return await engine.executePreHooks(toolName, params, cline);
-}
+// async function runGovernanceGuard(toolName: string, params: any, cline: any): Promise<{ allowed: boolean; error?: string }> {
+//     return await engine.executePreHooks(toolName, params, cline);
+// }
 export async function presentAssistantMessage(cline: Task) {
 	if (cline.abort) {
 		throw new Error(`[Task#presentAssistantMessage] task ${cline.taskId}.${cline.instanceId} aborted`)
@@ -711,31 +711,35 @@ export async function presentAssistantMessage(cline: Task) {
 				}
 			}
 
-		switch (block.name) {
- case "write_to_file": {
-    if (block.partial) break;
+switch (block.name) {
+    case "write_to_file": {
+        if (block.partial) break;
 
-    const guard = await runGovernanceGuard("write_to_file", block.params, cline);
-    if (!guard.allowed) {
-        // Show error directly in UI (this is what user sees)
-        await cline.say("error", guard.error || "ERROR: Cannot write file - No active intent selected. Operation blocked.");
-        
-        // 🚨 CRITICAL: Tell system we're done
-        cline.didAlreadyUseTool = true;      // Signals tool was used
-        cline.userMessageContentReady = true; // Forces turn to end
-        
-        // NO tool result at all - this prevents LLM response
+        const guard = await runGovernanceGuard("write_to_file", block.params, cline);
+        if (!guard.allowed) {
+            await cline.say("error", guard.error || "ERROR: Cannot write file - No active intent selected. Operation blocked.");
+            
+            // ✅ Send the error to the model so it knows what happened
+            cline.pushToolResultToUserContent({
+                type: "tool_result",
+                tool_use_id: sanitizeToolUseId(block.id),
+                content: guard.error || "ERROR: Cannot write file - No active intent selected. Operation blocked.",
+                is_error: true,
+            });
+            
+            cline.didAlreadyUseTool = true;
+            cline.userMessageContentReady = true;
+            break;
+        }
+
+        await checkpointSaveAndMark(cline);
+        await writeToFileTool.handle(cline, block as ToolUse<"write_to_file">, {
+            askApproval,
+            handleError,
+            pushToolResult,
+        });
         break;
     }
-
-    await checkpointSaveAndMark(cline);
-    await writeToFileTool.handle(cline, block as ToolUse<"write_to_file">, {
-        askApproval,
-        handleError,
-        pushToolResult,
-    });
-    break;
-}
 
     case "update_todo_list":
         await updateTodoListTool.handle(cline, block as ToolUse<"update_todo_list">, {
@@ -750,16 +754,18 @@ export async function presentAssistantMessage(cline: Task) {
 
         const guard = await runGovernanceGuard("apply_diff", block.params, cline);
         if (!guard.allowed) {
-            // Show error directly in UI
             await cline.say("error", guard.error || "ERROR: Cannot apply diff - No active intent selected. Operation blocked.");
             
-            // Send empty tool result to prevent LLM response
+            // ✅ FIXED: Send error message to model
             cline.pushToolResultToUserContent({
                 type: "tool_result",
                 tool_use_id: sanitizeToolUseId(block.id),
-                content: "",
+                content: guard.error || "ERROR: Cannot apply diff - No active intent selected. Operation blocked.",
                 is_error: true,
             });
+            
+            cline.didAlreadyUseTool = true;
+            cline.userMessageContentReady = true;
             break;
         }
 
@@ -774,40 +780,62 @@ export async function presentAssistantMessage(cline: Task) {
 
     case "edit":
     case "search_and_replace":
-        await checkpointSaveAndMark(cline);
-        await editTool.handle(cline, block as ToolUse<"edit">, {
-            askApproval,
-            handleError,
-            pushToolResult,
-        });
-        break;
-
     case "search_replace":
-        await checkpointSaveAndMark(cline);
-        await searchReplaceTool.handle(cline, block as ToolUse<"search_replace">, {
-            askApproval,
-            handleError,
-            pushToolResult,
-        });
-        break;
-
     case "edit_file":
+    case "apply_patch": {
+        if (block.partial) break;
+        
+        const guard = await runGovernanceGuard(block.name, block.params, cline);
+        if (!guard.allowed) {
+            await cline.say("error", guard.error || `ERROR: Cannot ${block.name} - No active intent selected. Operation blocked.`);
+            
+            // ✅ FIXED: Send error message to model
+            cline.pushToolResultToUserContent({
+                type: "tool_result",
+                tool_use_id: sanitizeToolUseId(block.id),
+                content: guard.error || `ERROR: Cannot ${block.name} - No active intent selected. Operation blocked.`,
+                is_error: true,
+            });
+            
+            cline.didAlreadyUseTool = true;
+            cline.userMessageContentReady = true;
+            break;
+        }
+        
         await checkpointSaveAndMark(cline);
-        await editFileTool.handle(cline, block as ToolUse<"edit_file">, {
-            askApproval,
-            handleError,
-            pushToolResult,
-        });
+        
+        // Handle each tool type separately with proper casting
+        if (block.name === "edit") {
+            await editTool.handle(cline, block as ToolUse<"edit">, {
+                askApproval,
+                handleError,
+                pushToolResult,
+            });
+        } 
+        else if (block.name === "search_and_replace" || block.name === "search_replace") {
+            // For both search_and_replace and search_replace, use the same handler
+            await searchReplaceTool.handle(cline, block as unknown as ToolUse<typeof block.name>, {
+                askApproval,
+                handleError,
+                pushToolResult,
+            });
+        }
+        else if (block.name === "edit_file") {
+            await editFileTool.handle(cline, block as ToolUse<"edit_file">, {
+                askApproval,
+                handleError,
+                pushToolResult,
+            });
+        }
+        else if (block.name === "apply_patch") {
+            await applyPatchTool.handle(cline, block as ToolUse<"apply_patch">, {
+                askApproval,
+                handleError,
+                pushToolResult,
+            });
+        }
         break;
-
-    case "apply_patch":
-        await checkpointSaveAndMark(cline);
-        await applyPatchTool.handle(cline, block as ToolUse<"apply_patch">, {
-            askApproval,
-            handleError,
-            pushToolResult,
-        });
-        break;
+    }
 
     case "read_file":
         await readFileTool.handle(cline, block as ToolUse<"read_file">, {
@@ -846,16 +874,18 @@ export async function presentAssistantMessage(cline: Task) {
 
         const guard = await runGovernanceGuard("execute_command", block.params, cline);
         if (!guard.allowed) {
-            // Show error directly in UI
             await cline.say("error", guard.error || "ERROR: Cannot execute command - No active intent selected. Operation blocked.");
             
-            // Send empty tool result to prevent LLM response
+            // ✅ FIXED: Send error message to model
             cline.pushToolResultToUserContent({
                 type: "tool_result",
                 tool_use_id: sanitizeToolUseId(block.id),
-                content: "",
+                content: guard.error || "ERROR: Cannot execute command - No active intent selected. Operation blocked.",
                 is_error: true,
             });
+            
+            cline.didAlreadyUseTool = true;
+            cline.userMessageContentReady = true;
             break;
         }
 
@@ -907,7 +937,26 @@ export async function presentAssistantMessage(cline: Task) {
         });
         break;
 
-    case "new_task":
+    case "new_task": {
+        if (block.partial) break;
+        
+        const guard = await runGovernanceGuard("new_task", block.params, cline);
+        if (!guard.allowed) {
+            await cline.say("error", guard.error || "ERROR: Cannot create new task - No active intent selected. Operation blocked.");
+            
+            // ✅ FIXED: Send error message to model
+            cline.pushToolResultToUserContent({
+                type: "tool_result",
+                tool_use_id: sanitizeToolUseId(block.id),
+                content: guard.error || "ERROR: Cannot create new task - No active intent selected. Operation blocked.",
+                is_error: true,
+            });
+            
+            cline.didAlreadyUseTool = true;
+            cline.userMessageContentReady = true;
+            break;
+        }
+        
         await checkpointSaveAndMark(cline);
         await newTaskTool.handle(cline, block as ToolUse<"new_task">, {
             askApproval,
@@ -916,6 +965,7 @@ export async function presentAssistantMessage(cline: Task) {
             toolCallId: block.id,
         });
         break;
+    }
 
     case "attempt_completion": {
         const completionCallbacks: AttemptCompletionCallbacks = {
@@ -959,56 +1009,62 @@ export async function presentAssistantMessage(cline: Task) {
         break;
 
     // --- GOVERNANCE HANDSHAKE CASES ---
-    case "select_active_intent": {
-        if (block.partial) break;
+ case "select_active_intent": {
+    if (block.partial) break;
+    
+    try {
+        const params = (block as any).nativeArgs || (block as any).params;
+        const intentId = params?.intent_id;
         
-        try {
-            const params = (block as any).nativeArgs || (block as any).params;
-            const intentId = params?.intent_id;
-            
-            if (!intentId) {
-                pushToolResult("Error: intent_id is required.");
-                break;
-            }
-            
-            const intentHook = engine.getIntentHook();
-            if (!intentHook) {
-                pushToolResult("Error: Intent hook not initialized");
-                break;
-            }
-            
-            const result = await intentHook.handleSelectIntent(intentId);
-            
-            if (!result.success) {
-                const errorMessage = result.error || "Unknown error activating intent";
-                pushToolResult(errorMessage);
-                break;
-            }
-            
-            // Success path
-            (cline as any).activeIntentId = intentId;
-            pushToolResult(`✅ Intent "${intentId}" activated.`);
-            
-            if (result.context) {
-                (cline as any).pendingContext = result.context;
-            }
-            
-            cline.didAlreadyUseTool = true;
-            
-        } catch (error: any) {
-            const errorMessage = error?.message || "Error activating intent";
-            pushToolResult(errorMessage);
-            await handleError("activating intent", error);
+        if (!intentId) {
+            pushToolResult("Error: intent_id is required.");
+            break;
         }
-        break;
+        
+        const intentHook = engine.getIntentHook();
+        if (!intentHook) {
+            pushToolResult("Error: Intent hook not initialized");
+            break;
+        }
+        
+        const result = await intentHook.handleSelectIntent(intentId);
+        
+        if (!result.success) {
+            const errorMessage = result.error || "Unknown error activating intent";
+            pushToolResult(errorMessage);
+            break;
+        }
+        
+        // Success path
+cline.setActiveIntentId(intentId);
+        console.log(`✅ INTENT SET: activeIntentId = ${(cline as any).activeIntentId}`); // ADD THIS
+        
+        pushToolResult(`✅ Intent "${intentId}" activated.`);
+        
+        if (result.context) {
+            (cline as any).pendingContext = result.context;
+        }
+        
+        cline.didAlreadyUseTool = true;
+        
+    } catch (error: any) {
+        const errorMessage = error?.message || "Error activating intent";
+        pushToolResult(errorMessage);
+        await handleError("activating intent", error);
     }
+    break;
+}
 
-    case "clear_active_intent": {
+   case "clear_active_intent": {
+    const intentHook = engine.getIntentHook();
+    if (intentHook) {
         intentHook.clearIntent();
-        (cline as any).activeIntentId = null;
-        pushToolResult("✅ Intent cleared.");
-        break;
     }
+    // ✅ USE THE SETTER METHOD
+    cline.setActiveIntentId(null);
+    pushToolResult("✅ Intent cleared.");
+    break;
+}
     // --- END GOVERNANCE HANDSHAKE ---
 
     default: {
@@ -1064,7 +1120,7 @@ export async function presentAssistantMessage(cline: Task) {
         cline.pushToolResultToUserContent({
             type: "tool_result",
             tool_use_id: sanitizeToolUseId(toolCallId),
-            content: "",  // Empty to prevent LLM response
+            content: errorMessage,  // ✅ FIXED: Send actual error message
             is_error: true,
         });
         break;

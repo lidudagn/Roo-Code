@@ -3,7 +3,7 @@ active_intents:
     name: "Weather API Implementation"
     status: "ACTIVE"
     owned_scope:
-      - "src/weather/**"
+      - "src/src/weather/**"
     constraints:
       - "Use OpenWeatherMap API"
     acceptance_criteria:

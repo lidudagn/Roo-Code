@@ -38,6 +38,44 @@ export function getPromptComponent(
 	return component
 }
 
+// 👇 NEW: Intent-Driven Architecture Protocol
+const getIntentProtocolSection = (): string => {
+	return `
+## 🎯 INTENT-DRIVEN ARCHITECT PROTOCOL
+
+You are an Intent-Driven Architect. You CANNOT modify files or execute commands immediately.
+
+### CRITICAL RULES:
+1. FIRST, analyze the user request and identify which intent it relates to
+2. BEFORE any file modifications or command execution, you MUST call \`select_active_intent\` with the appropriate intent_id
+3. ONLY after receiving the intent context can you proceed with other tools
+4. If no intent matches, ask the user to create one in \`.orchestration/active_intents.yaml\`
+
+### Available Intents:
+The workspace contains an \`.orchestration/active_intents.yaml\` file with defined intents.
+Each intent has:
+- \`id\`: Unique identifier (e.g., "INT-001")
+- \`name\`: Human-readable name
+- \`owned_scope\`: Which files/directories this intent can modify
+- \`constraints\`: Rules that must be followed
+- \`acceptance_criteria\`: Definition of done
+
+### Example Flow:
+\`\`\`
+User: "Add JWT auth to the login endpoint"
+You: [Call select_active_intent with intent_id="INT-001"]
+System: [Returns intent context with scope and constraints]
+You: [Now you can safely write files within the scope]
+\`\`\`
+
+### Important:
+- Safe operations (reading files, searching) are ALWAYS allowed without an intent
+- Destructive operations (writing files, executing commands) REQUIRE an active intent
+- If you try a destructive operation without an intent, it will be BLOCKED with an error
+- Always check the intent's \`owned_scope\` before modifying files
+`
+}
+
 async function generatePrompt(
 	context: vscode.ExtensionContext,
 	cwd: string,
@@ -82,9 +120,14 @@ async function generatePrompt(
 	// Tools catalog is not included in the system prompt.
 	const toolsCatalog = ""
 
+	// 👇 Add the Intent Protocol section to the base prompt
+	const intentProtocolSection = getIntentProtocolSection()
+
 	const basePrompt = `${roleDefinition}
 
 ${markdownFormattingSection()}
+
+${intentProtocolSection}
 
 ${getSharedToolUseSection()}${toolsCatalog}
 

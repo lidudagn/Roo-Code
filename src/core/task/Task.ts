@@ -157,6 +157,7 @@ export interface TaskOptions extends CreateTaskOptions {
 	onCreated?: (task: Task) => void
 	initialTodos?: TodoItem[]
 	workspacePath?: string
+	 
 	/** Initial status for the task's history item (e.g., "active" for child tasks) */
 	initialStatus?: "active" | "delegated" | "completed"
 }
@@ -373,6 +374,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * @param toolResult - The tool_result block to add
 	 * @returns true if added, false if duplicate was skipped
 	 */
+
+
+	public getActiveIntentId(): string | null {
+    return this.activeIntentId
+}
+public setActiveIntentId(intentId: string | null): void {
+    this.activeIntentId = intentId
+}
 	public pushToolResultToUserContent(toolResult: Anthropic.ToolResultBlockParam): boolean {
 		const existingResult = this.userMessageContent.find(
 			(block): block is Anthropic.ToolResultBlockParam =>

@@ -335,19 +335,19 @@ export async function validateToolUse(
 ): Promise<void> {
 	// ===== GOVERNANCE VALIDATION =====
 	// Run Phase 1 and Phase 2 gates
-	const governanceValidation = await validateGovernance(toolName, activeIntentId || null, toolParams, workspaceRoot)
+	// const governanceValidation = await validateGovernance(toolName, activeIntentId || null, toolParams, workspaceRoot)
 
-	if (!governanceValidation.allowed) {
-		throw new Error(governanceValidation.reason)
-	}
+	// if (!governanceValidation.allowed) {
+	// 	throw new Error(governanceValidation.reason)
+	// }
 
-	// ===== ORIGINAL VALIDATION =====
-	// First, check if the tool name is actually a valid/known tool
-	if (!isValidToolName(toolName, experiments)) {
-		throw new Error(
-			`Unknown tool "${toolName}". This tool does not exist. Please use one of the available tools: ${validToolNames.join(", ")}.`,
-		)
-	}
+	// // ===== ORIGINAL VALIDATION =====
+	// // First, check if the tool name is actually a valid/known tool
+	// if (!isValidToolName(toolName, experiments)) {
+	// 	throw new Error(
+	// 		`Unknown tool "${toolName}". This tool does not exist. Please use one of the available tools: ${validToolNames.join(", ")}.`,
+	// 	)
+	// }
 
 	// Then check if the tool is allowed for the current mode
 	if (

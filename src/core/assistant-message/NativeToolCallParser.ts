@@ -633,8 +633,18 @@ export class NativeToolCallParser {
 						message: partialArgs.message,
 						todos: partialArgs.todos,
 					}
+
+					
 				}
 				break
+				case "select_active_intent":
+    if (partialArgs.intent_id !== undefined) {
+        nativeArgs = {
+            intent_id: partialArgs.intent_id,
+            justification: partialArgs.justification,
+        }
+    }
+    break
 
 			default:
 				break
@@ -983,7 +993,14 @@ export class NativeToolCallParser {
 						} as NativeArgsFor<TName>
 					}
 					break
-
+case "select_active_intent":
+    if (args.intent_id !== undefined) {
+        nativeArgs = {
+            intent_id: args.intent_id,
+            justification: args.justification,
+        } as NativeArgsFor<TName>
+    }
+    break
 				default:
 					if (customToolRegistry.has(resolvedName)) {
 						nativeArgs = args as NativeArgsFor<TName>

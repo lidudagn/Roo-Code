@@ -1,0 +1,1 @@
+function getWeather() { return 'sunny'; }
