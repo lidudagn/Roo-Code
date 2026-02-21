@@ -6,12 +6,13 @@ import type { ToolName, ClineAsk, ToolProgressStatus } from "@roo-code/types"
 import { ConsecutiveMistakeError, TelemetryEventName } from "@roo-code/types"
 import { TelemetryService } from "@roo-code/telemetry"
 import { customToolRegistry } from "@roo-code/core"
-
+import * as crypto from 'crypto';
+import { OptimisticLocking } from '../../utils/locking';
 import { t } from "../../i18n"
 import { TraceService } from '../../services/trace/TraceService';
 import { defaultModeSlug, getModeBySlug } from "../../shared/modes"
 import type { ToolParamName, ToolResponse, ToolUse, McpToolUse } from "../../shared/tools"
-
+import { recordLessonTool } from "../tools/RecordLessonTool";
 import { AskIgnoredError } from "../task/AskIgnoredError"
 import { Task } from "../task/Task"
 import * as fs from "fs/promises";
@@ -44,6 +45,7 @@ import { sanitizeToolUseId } from "../../utils/tool-id"
 import { enforceScope, loadIntentScope, requestManualApproval, classifyAction, runGovernanceGuard } from "../../hooks/scopeEnforcer"
 import path from "path"
 import { intentHook ,engine} from "../../hooks"
+import { IntentMapService } from "../../services/IntentMap/IntentMapService"
 /**
  * Processes and presents assistant message content to the user interface.
  *
@@ -712,65 +714,47 @@ export async function presentAssistantMessage(cline: Task) {
 			}
 
 switch (block.name) {
-    // case "write_to_file": {
-    //     if (block.partial) break;
-
-    //     const guard = await runGovernanceGuard("write_to_file", block.params, cline);
-    //     if (!guard.allowed) {
-    //         await cline.say("error", guard.error || "ERROR: Cannot write file - No active intent selected. Operation blocked.");
-            
-    //         // ✅ Send the error to the model so it knows what happened
-    //         cline.pushToolResultToUserContent({
-    //             type: "tool_result",
-    //             tool_use_id: sanitizeToolUseId(block.id),
-    //             content: guard.error || "ERROR: Cannot write file - No active intent selected. Operation blocked.",
-    //             is_error: true,
-    //         });
-            
-    //         cline.didAlreadyUseTool = true;
-    //         cline.userMessageContentReady = true;
-    //         break;
-    //     }
-
-    //     await checkpointSaveAndMark(cline);
-    //     await writeToFileTool.handle(cline, block as ToolUse<"write_to_file">, {
-    //         askApproval,
-    //         handleError,
-    //         pushToolResult,
-    //     });
-    //     break;
-    // }
 case "write_to_file": {
     if (block.partial) break;
     
-    const guard = await runGovernanceGuard("write_to_file", block.params, cline);
-    if (!guard.allowed) {
-        await cline.say("error", guard.error || "ERROR: Cannot write file - No active intent selected. Operation blocked.");
-        
-        cline.pushToolResultToUserContent({
-            type: "tool_result",
-            tool_use_id: sanitizeToolUseId(block.id),
-            content: guard.error || "ERROR: Cannot write file - No active intent selected. Operation blocked.",
-            is_error: true,
-        });
-        
+    // Add locking before guard
+    const filePath = block.params?.path;
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const agentId = cline.taskId;
+    let oldContent: string | null = null;
+    let fileHash = 'new-file';
+    
+    if (workspaceRoot && filePath) {
+        const fullPath = path.isAbsolute(filePath) ? filePath : path.join(workspaceRoot, filePath);
+        try {
+            oldContent = await fs.readFile(fullPath, 'utf-8').catch(() => null);
+            if (oldContent) {
+                fileHash = crypto.createHash('sha256').update(oldContent).digest('hex');
+            }
+        } catch {}
+    }
+    
+    // Acquire lock
+    if (filePath && !OptimisticLocking.acquireLock(filePath, agentId, fileHash)) {
+        pushToolResult('⚠️ File is locked by another agent. Try again later.');
         cline.didAlreadyUseTool = true;
         cline.userMessageContentReady = true;
         break;
     }
     
-    // 👇 NEW: Read old content if file exists (for classification)
-    let oldContent: string | null = null;
-    const filePath = block.params?.path;
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    
-    if (workspaceRoot && filePath) {
-        try {
-            const fullPath = path.isAbsolute(filePath) ? filePath : path.join(workspaceRoot, filePath);
-            oldContent = await fs.readFile(fullPath, 'utf-8').catch(() => null);
-        } catch {
-            // File doesn't exist yet - that's fine
-        }
+    const guard = await runGovernanceGuard("write_to_file", block.params, cline);
+    if (!guard.allowed) {
+        OptimisticLocking.releaseLock(filePath, agentId);
+        await cline.say("error", guard.error);
+        cline.pushToolResultToUserContent({
+            type: "tool_result",
+            tool_use_id: sanitizeToolUseId(block.id),
+            content: guard.error,
+            is_error: true,
+        });
+        cline.didAlreadyUseTool = true;
+        cline.userMessageContentReady = true;
+        break;
     }
     
     await checkpointSaveAndMark(cline);
@@ -780,36 +764,54 @@ case "write_to_file": {
         pushToolResult,
     });
     
-    // 👇 NEW: Record trace after successful write
-    if (workspaceRoot && filePath && cline.getActiveIntentId()) {
-        try {
-            const fullPath = path.isAbsolute(filePath) ? filePath : path.join(workspaceRoot, filePath);
-            
-            // Read the content that was written
-            const newContent = await fs.readFile(fullPath, 'utf-8').catch(() => null);
-            
-            if (newContent) {
-                const modelInfo = cline.api.getModel();
-                const traceService = TraceService.getInstance();
-                
-                await traceService.recordFileWrite(
-                    workspaceRoot,
-                    fullPath,
-                    newContent,
-                    cline.getActiveIntentId()!,
-                    cline.taskId,
-                    modelInfo.id,
-                    oldContent
-                );
-                
-                console.log(`[TraceService] Trace recorded for ${filePath}`);
-            }
-        } catch (traceError) {
-            console.error('[TraceService] Failed to record trace:', traceError);
-            // Don't fail the main operation if tracing fails
+    // Update lock with new content
+    if (workspaceRoot && filePath) {
+        const fullPath = path.isAbsolute(filePath) ? filePath : path.join(workspaceRoot, filePath);
+        const newContent = await fs.readFile(fullPath, 'utf-8').catch(() => null);
+        if (newContent) {
+            const newHash = crypto.createHash('sha256').update(newContent).digest('hex');
+            OptimisticLocking.updateLock(filePath, agentId, newHash);
         }
     }
     
+    // 👇 ADD THIS - Update intent map
+ if (workspaceRoot && filePath && cline.getActiveIntentId()) {
+    try {
+        const fullPath = path.isAbsolute(filePath) ? filePath : path.join(workspaceRoot, filePath);
+        const intentMapService = IntentMapService.getInstance();
+        const intentId = cline.getActiveIntentId()!;
+        
+        // 👇 FIX: Calculate projectRoot HERE and pass it
+        const projectRoot = workspaceRoot.replace(/\/src$/, '');
+        const yamlPath = path.join(projectRoot, '.orchestration', 'active_intents.yaml');
+        let intentName = intentId;
+        
+        try {
+            const yamlContent = await fs.readFile(yamlPath, 'utf-8');
+            const { load } = require('js-yaml');
+            const data = load(yamlContent);
+            const intent = data.active_intents?.find((i: any) => i.id === intentId);
+            if (intent) {
+                intentName = intent.name;
+            }
+        } catch (e) {
+            console.error('[IntentMap] Failed to load intent name:', e);
+        }
+        
+        // 👇 FIX: Pass projectRoot instead of workspaceRoot
+        await intentMapService.addFileMapping(
+            projectRoot,  // Pass the fixed path!
+            intentId,
+            intentName,
+            fullPath
+        );
+        
+        console.log(`[IntentMap] ✅ Updated map for ${intentId} -> ${filePath}`);
+        
+    } catch (mapError) {
+        console.error('[IntentMap] Failed to update map:', mapError);
+    }
+}
     break;
 }
     case "update_todo_list":
@@ -939,7 +941,16 @@ case "write_to_file": {
             pushToolResult,
         });
         break;
-
+case "record_lesson": {
+    if (block.partial) break;
+    
+    await recordLessonTool.handle(cline, block as ToolUse<"record_lesson">, {
+        askApproval,
+        handleError,
+        pushToolResult,
+    });
+    break;
+}
     case "execute_command": {
         if (block.partial) break;
 

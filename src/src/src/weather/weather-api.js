@@ -1,0 +1,1 @@
+// weather api getTemprature funtion  function getTemperature(city){return 25;}

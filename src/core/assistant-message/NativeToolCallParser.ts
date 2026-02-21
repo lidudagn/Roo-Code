@@ -395,6 +395,7 @@ export class NativeToolCallParser {
 		let usedLegacyFormat = false
 
 		switch (name) {
+
 			case "read_file":
 				// Check for legacy format first: { files: [...] }
 				// Handle both array and stringified array (some models double-stringify)
@@ -646,6 +647,14 @@ export class NativeToolCallParser {
     }
     break
 
+				case "record_lesson":
+    if (partialArgs.lesson !== undefined) {
+        nativeArgs = {
+            lesson: partialArgs.lesson,
+            category: partialArgs.category,
+        }
+    }
+    break
 			default:
 				break
 		}
@@ -735,6 +744,7 @@ export class NativeToolCallParser {
 			let usedLegacyFormat = false
 
 			switch (resolvedName) {
+
 				case "read_file":
 					// Check for legacy format first: { files: [...] }
 					// Handle both array and stringified array (some models double-stringify)
@@ -998,6 +1008,14 @@ case "select_active_intent":
         nativeArgs = {
             intent_id: args.intent_id,
             justification: args.justification,
+        } as NativeArgsFor<TName>
+    }
+    break
+					case "record_lesson":
+    if (args.lesson !== undefined) {
+        nativeArgs = {
+            lesson: args.lesson,
+            category: args.category,
         } as NativeArgsFor<TName>
     }
     break

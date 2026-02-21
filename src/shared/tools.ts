@@ -82,6 +82,8 @@ export const toolParamNames = [
 	"line_ranges",
 	"intent_id", // 👈 ADD THIS
 	"justification", // 👈 ADD THIS
+	"lesson",      // 👈 ADD THIS
+	"category",    // 👈 ADD THIS
 ] as const
 
 export type ToolParamName = (typeof toolParamNames)[number]
@@ -91,7 +93,9 @@ export type ToolParamName = (typeof toolParamNames)[number]
  * Tools not listed here will fall back to `any` for backward compatibility.
  */
 export type NativeToolArgs = {
-	select_active_intent: { intent_id: string; justification?: string } // 👈 ADD THIS
+	select_active_intent: { intent_id: string; justification?: string } 
+	record_lesson: { lesson: string; category?: string }
+	
 	access_mcp_resource: { server_name: string; uri: string }
 	read_file: import("@roo-code/types").ReadFileToolParams
 	read_command_output: { artifact_id: string; search?: string; offset?: number; limit?: number }
@@ -293,6 +297,8 @@ export const TOOL_DISPLAY_NAMES: Record<ToolName, string> = {
 	generate_image: "generate images",
 	custom_tool: "use custom tools",
 	select_active_intent: "select active intent",
+	record_lesson: "record lesson", 
+	clear_active_intent: "clear active intent",
 } as const
 
 // Define available tool groups.
@@ -311,7 +317,7 @@ export const TOOL_GROUPS: Record<ToolGroup, ToolGroupConfig> = {
 		tools: ["use_mcp_tool", "access_mcp_resource"],
 	},
 	modes: {
-		tools: ["switch_mode", "new_task"],
+		tools: ["switch_mode", "new_task", "record_lesson"], // 👈 ADD HERE
 		alwaysAvailable: true,
 	},
 }
@@ -326,6 +332,8 @@ export const ALWAYS_AVAILABLE_TOOLS: ToolName[] = [
 	"run_slash_command",
 	"skill",
 	"select_active_intent",
+		"record_lesson",        // 👈 ADD THIS
+		"clear_active_intent",  // 👈 ADD THIS
 ] as const
 
 /**
